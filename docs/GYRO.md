@@ -69,6 +69,14 @@ path against the fork's GGML graph. The reference trellis dequantizers match GGM
 decode output matched upstream byte for byte (same synthetic four-token input). These checks do not establish
 speed or full-model token parity against llama.cpp. M1-M4 and Gyro-M full-model runs have not been measured.
 
+Full-model smoke checks on that Mac (2026-10-13) used the requested Huihui Gyro-S file
+(`Qwen3.8-Flash-Next-Gyro-S-abliterated-TQ1_0.gguf`, SHA-256
+`783e1af72859c48146162840f1a2173922c03e4befaeea4add7578ad25c303a3`). The repack's 1,223 tensors matched the source
+bytes. The engine answered "The capital of France is Paris." and recalled "SILICON" from a 234-token prompt.
+The local OpenAI-compatible chat API also answered correctly. These were smoke checks at 4K context without an
+MTP draft layer, not a speed or quality benchmark. The original Gyro-S file also passed these generation checks,
+and a forced 4 GB expert arena matched its resident short-prompt tokens (48 generated tokens, prompt chunks 128).
+
 To run the synthetic checks (after setup has obtained both header dependencies):
 
 ```sh
