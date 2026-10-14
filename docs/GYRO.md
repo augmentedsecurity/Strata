@@ -77,6 +77,24 @@ The local OpenAI-compatible chat API also answered correctly. These were smoke c
 MTP draft layer, not a speed or quality benchmark. The original Gyro-S file also passed these generation checks,
 and a forced 4 GB expert arena matched its resident short-prompt tokens (48 generated tokens, prompt chunks 128).
 
+The same Huihui Gyro-S also passed a resident MTP/context sweep on that Mac, with 131,072-token capacity,
+INT8 KV, greedy decoding, `--spec 2 --spec-min-p 0.5 --suffix-draft 0`. Every run generated 256 prose tokens;
+these are single fresh-process measurements, not medians. MTP used Strata's Q2_0 draft head from the pinned
+original checkpoint (all 31 source tensors verified).
+
+| Input tokens | MTP decode tokens/s | Prompt tokens/s |
+|---:|---:|---:|
+| 4,096 | 75.48 | 1,201.67 |
+| 32,768 | 70.10 | 1,127.06 |
+| 65,536 | 65.17 | 1,095.35 |
+| 130,816 | 61.85 | 1,024.08 |
+
+The top run filled the context with 130,816 input tokens plus 256 generated tokens. All 256 outputs matched
+the no-MTP reference at short, 4K and full context; the full-context no-MTP reference measured 38.77 tokens/s
+while draft preparation was still finishing, so its absolute timing is approximate. A short API request also
+passed with MTP and 128K capacity configured. These checks do not establish long-context recall or quality;
+see the [report and raw timings](../bench/results/2026-10-13-community-m5-max-huihui-gyro/README.md).
+
 To run the synthetic checks (after setup has obtained both header dependencies):
 
 ```sh
