@@ -12,11 +12,13 @@
 #define GGML_COMMON_DECL_CPP
 #define GGML_COMMON_IMPL_CPP
 #include "ggml-common.h"
+#include "ggml-common-tq.h"
 
 namespace ref {
 
 const char* type_name(int t) {
     switch (t) {
+        case TQ2_T: return "TQ2_T"; case TQK6: return "TQK6"; case TQK7: return "TQK7";
         case F32: return "F32"; case F16: return "F16"; case BF16: return "BF16";
         case Q4_0: return "Q4_0"; case Q5_0: return "Q5_0"; case Q5_1: return "Q5_1"; case Q8_0: return "Q8_0";
         case Q3_K: return "Q3_K"; case Q4_K: return "Q4_K"; case Q5_K: return "Q5_K"; case Q6_K: return "Q6_K";
@@ -31,6 +33,7 @@ int block_elems(int t) {
     switch (t) {
         case F32: case F16: case BF16: return 1;
         case Q4_0: case Q5_0: case Q5_1: case Q8_0: case IQ4_NL: return 32;
+        case TQ2_T: case TQK6: case TQK7: return 128;
         case Q2_0: return 64;
         default: return 256;
     }
@@ -38,6 +41,7 @@ int block_elems(int t) {
 
 int block_bytes(int t) {
     switch (t) {
+        case TQ2_T: return 34; case TQK6: return 26; case TQK7: return 30;
         case F32: return 4; case F16: case BF16: return 2;
         case Q4_0: return 18; case Q5_0: return 22; case Q5_1: return 24; case Q8_0: return 34; case IQ4_NL: return 18; case Q2_0: return 18;
         case Q3_K: return 110; case Q4_K: return 144; case Q5_K: return 176; case Q6_K: return 210;
@@ -387,6 +391,25 @@ void dequant(int t, const void* src, float* dst, size_t n) {
     if (t == F32) { std::memcpy(dst, s, n * 4); return; }
     if (t == F16) { for (size_t i = 0; i < n; ++i) dst[i] = f16_to_f32(rd16(s + 2 * i)); return; }
     if (t == BF16) { for (size_t i = 0; i < n; ++i) dst[i] = bf16_to_f32(rd16(s + 2 * i)); return; }
+    if (t == TQ2_T || t == TQK6 || t == TQK7) {
+        const int kb = t == TQ2_T ? 8 : t == TQK6 ? 6 : 7, nb = 4 * kb;
+        for (size_t b = 0; b < n / 128; ++b, s += nb + 2) {
+            const uint8_t* q = s + 2;
+            for (int step = 0; step < 32; ++step) {
+                uint32_t state = 0;
+                if (kb == 8) state = (uint32_t(q[(step + 31) & 31]) << 8) | q[step];
+                else for (int bit = 0; bit < 15; ++bit) {
+                    const int pos = ((31 - step) * kb + bit) % (32 * kb);
+                    state |= uint32_t((q[pos / 8] >> (pos % 8)) & 1) << bit;
+                }
+                const uint32_t hash = (state & 0x7fff) * 0x9e3779b1u;
+                const uint32_t pts[] = {hash >> 21, (hash >> 10) & 2047};
+                for (int h = 0; h < 2; ++h) for (int j = 0; j < 2; ++j)
+                    dst[b * 128 + 4 * step + 2 * h + j] = f16_to_f32(rd16(s)) * f16_to_f32(tq_lut_f16[2 * pts[h] + j]);
+            }
+        }
+        return;
+    }
     const int be = block_elems(t), bb = block_bytes(t);
     for (size_t i = 0; i < n / be; ++i) deq_block(t, s + i * bb, dst + i * be);
 }
@@ -425,6 +448,7 @@ void random_blocks(int t, uint8_t* dst, int rows, int cols, uint64_t seed, float
         // the scale fields: magnitude so that |w| ~ scale.  Typical code magnitudes differ per type.
         const float u = 0.5f + r.uni();
         switch (t) {
+            case TQ2_T: case TQK6: case TQK7: put16(b, f32_to_f16(scale * u)); break;
             case Q2_0: put16(b, f32_to_f16(scale * u)); break;
             case Q8_0: put16(b, f32_to_f16(scale * u / 64)); break;
             case Q4_0: case IQ4_NL: put16(b, f32_to_f16(scale * u / (t == Q4_0 ? 4 : 64))); break;

@@ -35,11 +35,13 @@ target_include_directories(mtl_rt PUBLIC src ${STRATA_ROOT}/third_party/ggml)
 target_compile_options(mtl_rt PRIVATE $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>)
 target_compile_definitions(mtl_rt PRIVATE
   STRATA_GGML_COMMON_DEFAULT="${GGML_COMMON}"
+  STRATA_GGML_TQ_DEFAULT="${STRATA_ROOT}/third_party/ggml/ggml-common-tq.h"
   STRATA_METAL_KERNELS_DEFAULT="${CMAKE_CURRENT_SOURCE_DIR}/kernels")
 target_link_libraries(mtl_rt PUBLIC "-framework Metal" "-framework Foundation")
 
 file(GLOB STRATA_METAL_TESTS CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tests/*.cpp)
-list(REMOVE_ITEM STRATA_METAL_TESTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime_hello.cpp)
+list(REMOVE_ITEM STRATA_METAL_TESTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime_hello.cpp
+     ${CMAKE_CURRENT_SOURCE_DIR}/tests/hadamard_parity.cpp)
 foreach(src ${STRATA_METAL_TESTS})
   get_filename_component(t ${src} NAME_WE)
   add_executable(${t} ${src})
@@ -97,7 +99,8 @@ set(STRATA_METAL_HOST_SOURCES
   ${S}/kernels/ngram.cpp ${S}/ngram/ple_reader.cpp ${S}/platform/direct_file.cpp
   ${S}/prefill/prefill.cpp
   ${S}/spec/suffix_drafter.cpp ${S}/spec/controller.cpp ${S}/spec/draft_policy.cpp ${S}/spec/draft_source.cpp
-  ${S}/kernels/cpu/pool.cpp ${S}/kernels/cpu/expert_layout.cpp ${S}/kernels/cpu/native_expert.cpp)
+  ${S}/kernels/cpu/pool.cpp ${S}/kernels/cpu/expert_layout.cpp ${S}/kernels/cpu/native_expert.cpp
+  ${S}/kernels/cpu/hadamard.cpp ${S}/kernels/cpu/tq_cpu.cpp)
 set_source_files_properties(${S}/core/device.cu ${S}/core/pinned.cu PROPERTIES LANGUAGE CXX)
 
 # The kernel library: Metal implementations (src/engine/*.cpp) and, for every entry point not ported yet, a stub
@@ -121,3 +124,28 @@ target_link_libraries(strata_metal_kernels PUBLIC strata_metal_host mtl_rt)
 
 add_executable(strata ${S}/program/generate.cpp)
 target_link_libraries(strata PRIVATE strata_metal_kernels strata_metal_host strata_metal_kernels)
+
+# Gyro validation is opt-in so an ordinary upstream-ggml Metal build keeps its existing test set.
+option(STRATA_METAL_GYRO_TESTS "Build and register Gyro/trellis Metal parity tests (agention ggml)" OFF)
+if(STRATA_METAL_GYRO_TESTS)
+  add_executable(hadamard_parity tests/hadamard_parity.cpp ${S}/kernels/cpu/hadamard.cpp)
+  target_include_directories(hadamard_parity PRIVATE ${STRATA_ROOT}/include ${STRATA_GGML_DIR}/ggml/src)
+  target_link_libraries(hadamard_parity PRIVATE mtl_rt ggml-base)
+  add_test(NAME hadamard_parity COMMAND hadamard_parity)
+  add_executable(native_hadamard_test ${S}/kernels/cpu/native_hadamard_test.cpp)
+  target_link_libraries(native_hadamard_test PRIVATE strata_metal_kernels strata_metal_host strata_metal_kernels)
+  add_test(NAME native_hadamard_test COMMAND native_hadamard_test)
+  add_test(NAME native_hadamard_test_scalar COMMAND ${CMAKE_COMMAND} -E env STRATA_TQ_ISA=scalar $<TARGET_FILE:native_hadamard_test>)
+  foreach(pair IN ITEMS "TQK6;TQK7" "TQ2_T;TQ2_T")
+    list(GET pair 0 gu)
+    list(GET pair 1 dn)
+    foreach(nt IN ITEMS 1 4 8)
+      add_test(NAME gyro_decode_arena_${gu}_${nt} COMMAND expert_parity --gu ${gu} --dn ${dn} --ntok ${nt} --gucfg 32,1,4 --dncfg 4,2,4 --arena)
+      add_test(NAME gyro_decode_${gu}_${nt} COMMAND expert_parity --gu ${gu} --dn ${dn} --ntok ${nt} --gucfg 32,1,4 --dncfg 4,2,4)
+    endforeach()
+    add_test(NAME gyro_prompt_v2_${gu} COMMAND moe_mm_parity --gu ${gu} --dn ${dn} --T 16 --v2 --tile 16,64,16,2)
+    add_test(NAME gyro_prompt_hadamard_v2_${gu} COMMAND moe_mm_parity --gu ${gu} --dn ${dn} --T 16 --v2 --tile 16,64,16,2 --hadamard)
+    add_test(NAME gyro_prompt_hadamard_v3_${gu} COMMAND moe_mm_parity --gu ${gu} --dn ${dn} --T 16 --v3 --tile 16,32,32,4 --dtile 64,32,2 --hadamard)
+    add_test(NAME gyro_prompt_v3_${gu} COMMAND moe_mm_parity --gu ${gu} --dn ${dn} --T 16 --v3 --tile 16,32,32,4 --dtile 64,32,2)
+  endforeach()
+endif()

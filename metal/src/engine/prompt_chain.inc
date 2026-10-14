@@ -155,9 +155,13 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
     };
     auto dq = [&](const gguf::Tensor& t, const mtl::Buffer& out, size_t out_off = 0, uint32_t perm = 0) {
         const int n_in = (int) t.shape[0], n_out = t.shape.size() > 1 ? (int) t.shape[1] : 1;
-        PcDqArgs a{(uint32_t) n_in, (uint32_t) n_out, (uint32_t) ref::row_bytes(t.type, n_in), perm};
-        D(P_(b.lib, "dq_f16_" + std::to_string(t.type)), {mtl::Arg::B(W_, t.offset), mtl::Arg::B(out, out_off), mtl::Arg::V(a)},
-          (n_in / pc_unit_of(t.type) + 63) / 64, n_out, 64);
+        const bool bf = hc_bf_off_.count(t.name), q8 = had_.any() && q8off_.count(t.name);
+        const int type = bf ? ref::BF16 : q8 ? ref::Q8_0 : t.type;
+        const mtl::Buffer& source = bf ? HCbf_ : q8 ? Q8_ : W_;
+        const size_t offset = bf ? hc_bf_off_.at(t.name) : q8 ? q8off_.at(t.name) : t.offset;
+        PcDqArgs a{(uint32_t) n_in, (uint32_t) n_out, (uint32_t) ref::row_bytes(type, n_in), perm};
+        D(P_(b.lib, "dq_f16_" + std::to_string(type)), {mtl::Arg::B(source, offset), mtl::Arg::B(out, out_off), mtl::Arg::V(a)},
+          (n_in / pc_unit_of(type) + 63) / 64, n_out, 64);
     };
     auto act16 = [&](const mtl::Buffer& x, const mtl::Buffer& xh, size_t n) {
         const uint32_t nn = (uint32_t) n;
@@ -296,6 +300,7 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
         g.indirect = &b.meta;
         g.ind_off = 8 * 4;
         ds.push_back(g);
+        if (had_.gu(l)) rotate(ds, b.XS, b.XS, N, b.maxrows, true, &b.meta);
         auto tl3 = [](const int* t) { return std::to_string(t[0]) + "_" + std::to_string(t[1]) + "_" + std::to_string(t[2]) + "_" + std::to_string(t[3]); };
         mtl::Dispatch gu;
         if (b.k4) {
@@ -310,6 +315,7 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
         gu.indirect = &b.meta;
         gu.ind_off = 2 * 4;
         ds.push_back(gu);
+        if (had_.down(l)) rotate(ds, b.HS, b.HS, NFF, b.maxrows, true, &b.meta);
         mtl::Dispatch dn;
         if (b.k4) {
             const std::string fn = "mm_down3_" + std::to_string(ed.type) + "_" + tl3(b.dn3);

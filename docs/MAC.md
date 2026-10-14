@@ -35,6 +35,9 @@ with 32 GB, where the experts stream from the SSD. Other chips and memory sizes 
   - Measured at 32 GB (below). Smaller Macs are untested.
 - **Setup recommends, and never forces.** It recommends the pack by memory; a bigger pack chosen with `--model` is kept, with a warning about what it risks.
 
+Gyro-S and Gyro-M (agentionai's rotor/trellis files) use `tools/gyro_setup.sh --model S --backend metal`.
+Their formats and activation rotations are documented in [GYRO.md](GYRO.md).
+
 ## Install
 
 ```

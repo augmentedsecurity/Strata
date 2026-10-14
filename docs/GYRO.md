@@ -19,17 +19,19 @@ Qwen3.8-Flash-Next models. It is not the GGUF draft file from the Gyro repositor
 
 ## Quick setup
 
-Gyro support lives on the `rc2` branch of the agentionai Strata fork: Strata v0.1.40.3 plus the trellis types
-(TQ2_T / TQK6 / TQK7), the Hadamard rotation and the CPU trellis kernels.
+Gyro support lives on the `rc2` branch of the agentionai Strata fork. The Apple Silicon port combines its trellis
+formats (TQ2_T / TQK6 / TQK7), Hadamard rotation and CPU kernels with upstream Strata v0.1.44.1's Metal engine.
 
 ```sh
 git clone -b rc2 https://github.com/agentionai/Strata
 cd Strata
 ```
 
-`tools/gyro_setup.sh` does every step below on Linux:
+`tools/gyro_setup.sh` builds, downloads, packs and writes a server config on Linux or an Apple Silicon Mac:
 
 ```sh
+tools/gyro_setup.sh --model S --backend metal                     # Apple Silicon, macOS 15+
+tools/gyro_setup.sh --model S --backend metal --variant huihui    # Huihui abliterated Gyro
 tools/gyro_setup.sh --model S --backend cuda --cuda-arch 120       # RTX 50 series
 tools/gyro_setup.sh --model S --backend cuda --cuda-arch 89        # RTX 40 series
 tools/gyro_setup.sh --model S --backend cuda --cuda-arch 86        # RTX 30 series / RTX A6000
@@ -37,6 +39,46 @@ tools/gyro_setup.sh --model S --backend hip  --hip-arch gfx1201    # Radeon RX 9
 ```
 
 It prints the command that starts the server. The steps, by hand:
+
+## Apple Silicon
+
+Use `--backend metal` on macOS 15 or newer, an M1 or newer, with the Command Line Tools installed and Python 3.10
+or newer. It builds `build-metal/strata` with Apple's metal-cpp headers and the agentionai llama.cpp fork (a new
+checkout is pinned to `dc255f2a4b6e4211b555b0c05260b2523281f314`; `--llama DIR` keeps an existing checkout).
+`--variant huihui` selects `agentionai/Qwen3.8-Flash-Next-Gyro-abliterated-Huihui-GGUF` and uses a separate
+`gyro-s-huihui` / `gyro-m-huihui` pack and config, so the two variants can coexist.
+The ordinary Mac installer still offers its existing model families; use the Gyro setup command above for these files.
+
+The setup writes a page-aligned `<model>-metal.gguf` containing the dense weights and experts, with each tensor
+checked by SHA-256 against the download. It preserves the `prism.hadamard.*` metadata. The n-gram table stays in
+the original download, passed separately as `--ple-gguf`. Keep both files. Packing uses the Metal file so every
+expert offset matches the file the engine maps or streams.
+
+Both the decode kernels and the two prompt GEMM implementations decode the trellis formats from the canonical
+FP16 Hyb codebook. The Hadamard kernels rotate only routed inputs, before gate/up and before down; shared experts
+and routing read their original inputs. Decode rotates FP32. Prompt operands are FP16; the butterflies run in
+FP32 and round on the final store. Identity signs, explicit signs, per-layer roles and disk-streamed experts use
+the same paths. A mismatched or missing Hadamard pack is refused. The fused HC reader also handles Gyro's mixed
+Q6_K down/inject and Q8_0 up matrices: it dequantizes the former and prepares Q8_0 copies at load time.
+`STRATA_HC_Q8=0` prepares BF16 copies for the BF16 reader instead. The Mac's arena and memory limits are described
+in [MAC.md](MAC.md).
+
+Synthetic validation on an M5 Max (128 GB, macOS 26.6, Apple clang 21): both Gyro-S and Gyro-M format pairs,
+windows of 1/4/8 tokens, four-chunk expert arenas, prompt v2/v3, signed Hadamard prompt operands, and the ARM CPU
+path against the fork's GGML graph. The reference trellis dequantizers match GGML bit for bit. Ordinary Q2_0
+decode output matched upstream byte for byte (same synthetic four-token input). These checks do not establish
+speed or full-model token parity against llama.cpp. M1-M4 and Gyro-M full-model runs have not been measured.
+
+To run the synthetic checks (after setup has obtained both header dependencies):
+
+```sh
+cmake -S metal -B build-metal -DMETAL_CPP_DIR="$PWD/third_party/metal-cpp" \
+  -DSTRATA_GGML_DIR="$PWD/../agention-llama.cpp" -DSTRATA_METAL_GYRO_TESTS=ON
+cmake --build build-metal -j
+ctest --test-dir build-metal --output-on-failure
+```
+
+The remaining manual build instructions are for NVIDIA/AMD. On a Mac use the Metal setup command above.
 
 ## 1. Build
 

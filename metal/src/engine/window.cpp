@@ -22,6 +22,7 @@
 #include "strata/core/conversation_cache.hpp"
 #include "strata/core/session.hpp"
 #include "strata/kernels/ngram.hpp"
+#include "strata/kernels/cpu/hadamard.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -177,6 +178,12 @@ private:
     std::map<const mtl::Pipeline*, std::string> pkey_of_;
     void gemv(std::vector<mtl::Dispatch>& ds, const gguf::Tensor& t, const Act& x, const mtl::Buffer& y, size_t y_stride,
               int ntok, size_t y_off = 0, const mtl::Buffer* wb = nullptr);
+    strata::kernels::cpu::HadamardSpec had_;
+    int lhad_ = -1;
+    Act had_X_;
+    mtl::Buffer had_sx_, had_sh_;
+    void rotate(std::vector<mtl::Dispatch>& ds, const mtl::Buffer& x, const mtl::Buffer& y,
+                int width, int rows, bool half = false, const mtl::Buffer* meta = nullptr);
     void xprep(std::vector<mtl::Dispatch>& ds, const mtl::Buffer& x, const Act& out, int n);
     void gr_read(std::vector<mtl::Dispatch>& ds, const std::string& pre, bool apply, const Act& out, bool final_, int ntok);
     void layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0);
@@ -321,10 +328,10 @@ public:
     ~Window();
     void prof_add(bool draft, double ms) { Prof& x = draft ? dprof_ : cprof_; ++x.n; x.all += ms; }
 private:
-    // the Q8_0 copies of the hyper-connection matrices (the default; STRATA_HC_Q8=0: the BF16 originals)
+    // the HC fused readers: Q8_0 by default; with STRATA_HC_Q8=0, BF16 originals or converted quantized matrices
     bool hc_q8_ = false;
-    mtl::Buffer Q8_;
-    std::map<std::string, size_t> q8off_;
+    mtl::Buffer Q8_, HCbf_;
+    std::map<std::string, size_t> q8off_, hc_bf_off_;
     // MTP
     bool mtp_on_ = false;
     int lmtp_ = -1;
@@ -424,6 +431,29 @@ bool Window::init(const strata::core::ModelGeometry& g, strata::core::SessionSta
     }
     if (!f_.open(shard1, err)) return false;
     cx_ = std::make_unique<mtl::Context>();
+    had_ = strata::kernels::cpu::hadamard_spec();
+    const auto hv = f_.meta_num.find("prism.hadamard.version");
+    if (hv != f_.meta_num.end() &&
+        (hv->second != 1 || !had_.any() || f_.meta_num["prism.hadamard.block_size"] != had_.block)) {
+        err = "metal window: the GGUF Hadamard metadata disagrees with the pack; repack with tools/iq_pack.py";
+        return false;
+    }
+    if (had_.any()) {
+        if (had_.roles.size() != 48 || N % had_.block || NFF % had_.block) {
+            err = "metal window: unsupported Hadamard block or layer count"; return false;
+        }
+        lhad_ = cx_->compile({"hadamard.metal"}, "#define NO_GGML_COMMON 1\n");
+        had_X_.n = N;
+        had_X_.b = cx_->alloc(4 * (4 * MAXT * N + MAXT * N / 16));
+        auto signs = [&](int width) {
+            auto buf = cx_->alloc(4 * width);
+            const auto it = had_.signs.find(width);
+            if (it == had_.signs.end()) std::fill_n(buf.as<float>(), width, 1.0f);
+            else std::copy(it->second.begin(), it->second.end(), buf.as<float>());
+            return buf;
+        };
+        had_sx_ = signs(N); had_sh_ = signs(NFF);
+    }
     stream_ = ExpertStream::wanted(f_, *cx_);
     if (stream_) {
         // the model does not fit: the dense weights are read into memory below, the experts stream from the SSD
@@ -490,8 +520,8 @@ bool Window::init(const strata::core::ModelGeometry& g, strata::core::SessionSta
             pooled_.push_back(A(4 * (size_t) MB * 128));
         }
     }
-    // ---- the HC read in Q8_0 (the owner's default on Metal, as STRATA_HC_Q8 on gfx12): the BF16 down / up / inject
-    // matrices quantized once at load (ggml's q8_0 rule, ref_quant), read by gr_down_q8 / gr_up_q8
+    // ---- the HC read in Q8_0: BF16 matrices and Gyro's mixed quantized down/inject matrices are
+    // converted once at load (ggml's q8_0 rule, ref_quant), read by gr_down_q8 / gr_up_q8.
     {
         const char* e = std::getenv("STRATA_HC_Q8");
         hc_q8_ = !(e && std::string(e) == "0");
@@ -502,7 +532,8 @@ bool Window::init(const strata::core::ModelGeometry& g, strata::core::SessionSta
         std::vector<std::string> names;
         for (const auto& kv : f_.tensors) {
             const gguf::Tensor& x = kv.second;
-            if (x.type != ref::BF16 || x.name.find("hc_") == std::string::npos || x.name.find("_norm") != std::string::npos) continue;
+            if (x.name.find("hc_") == std::string::npos || x.name.find("_norm") != std::string::npos ||
+                x.type == ref::Q8_0 || x.type == ref::F32) continue;
             uint64_t ne = 1;
             for (uint64_t d : x.shape) ne *= d;
             q8off_[x.name] = tot;
@@ -527,7 +558,7 @@ bool Window::init(const strata::core::ModelGeometry& g, strata::core::SessionSta
                         if (!st_->read(raw.data(), x.bytes, x.offset)) { std::fprintf(stderr, "strata metal: read failed\n"); std::exit(6); }
                         src = raw.data();
                     }
-                    ref::dequant(ref::BF16, src, tmp.data(), ne);
+                    ref::dequant(x.type, src, tmp.data(), ne);
                     ref::quantize_q8_0(tmp.data(), ne, Q8_.as<uint8_t>() + q8off_[names[i]]);
                 }
             });
@@ -535,10 +566,38 @@ bool Window::init(const strata::core::ModelGeometry& g, strata::core::SessionSta
         std::fprintf(stderr, "strata metal: HC read in Q8_0 (STRATA_HC_Q8=0: BF16): %zu matrices, %.0f MB, made in %.0f ms\n",
                      names.size(), tot / 1e6, now_ms() - tq);
     }
+    if (!hc_q8_) {
+        // Gyro mixes Q6_K down/inject with Q8_0 up. The BF16 fused HC kernels need an explicit BF16 copy.
+        size_t total = 0;
+        for (const auto& [name, x] : f_.tensors) {
+            if (name.find("hc_") == std::string::npos || name.find("_norm") != std::string::npos || x.type == ref::BF16) continue;
+            uint64_t ne = 1; for (auto d : x.shape) ne *= d;
+            hc_bf_off_[name] = total; total += 2 * ne;
+        }
+        if (total) {
+            HCbf_ = cx_->alloc(total);
+            std::vector<float> tmp;
+            std::vector<uint8_t> raw;
+            for (const auto& [name, offset] : hc_bf_off_) {
+                const auto& x = T(name);
+                uint64_t ne = 1; for (auto d : x.shape) ne *= d;
+                tmp.resize(ne);
+                const uint8_t* src = (const uint8_t*)f_.map + x.offset;
+                if (stream_) {
+                    raw.resize(x.bytes);
+                    if (!st_->read(raw.data(), x.bytes, x.offset)) { err = "metal window: HC read failed"; return false; }
+                    src = raw.data();
+                }
+                ref::dequant(x.type, src, tmp.data(), ne);
+                for (size_t i = 0; i < ne; ++i) HCbf_.as<uint16_t>()[offset / 2 + i] = ref::f32_to_bf16(tmp[i]);
+            }
+        }
+    }
     if (stream_) {
-        std::vector<std::string> skip;   // the BF16 originals of the Q8_0 HC copies are not read again
+        std::vector<std::string> skip;   // converted HC matrices are read from their copies
         if (hc_q8_)
             for (const auto& kv : q8off_) skip.push_back(kv.first);
+        else for (const auto& kv : hc_bf_off_) skip.push_back(kv.first);
         if (!st_->load_dense(f_, *cx_, skip, W_, err)) return false;
         const char* e = std::getenv("STRATA_METAL_PREFETCH");
         st_pred_ = !(e && std::atoi(e) <= 0);
@@ -596,6 +655,18 @@ void Window::gemv(std::vector<mtl::Dispatch>& ds, const gguf::Tensor& t, const A
     push(ds, d);
 }
 
+void Window::rotate(std::vector<mtl::Dispatch>& ds, const mtl::Buffer& x, const mtl::Buffer& y,
+                    int width, int rows, bool half, const mtl::Buffer* meta) {
+    struct { uint32_t width, rows, block, indirect; } a{(uint32_t)width, (uint32_t)rows, (uint32_t)had_.block, meta ? 1u : 0u};
+    mtl::Dispatch d;
+    const std::string fn = half ? "hadamard_f16" : "hadamard_f32";
+    d.p = P(lhad_, fn, {}, fn);
+    d.args = {mtl::Arg::B(x), mtl::Arg::B(y), mtl::Arg::B(width == N ? had_sx_ : had_sh_),
+              mtl::Arg::V(a), mtl::Arg::B(meta ? *meta : x)};
+    d.grid[0] = width / had_.block; d.grid[1] = rows; d.tg[0] = 128;
+    push(ds, d);
+}
+
 void Window::xprep(std::vector<mtl::Dispatch>& ds, const mtl::Buffer& x, const Act& out, int n) {
     mtl::Dispatch d;
     d.p = P(lib_, "xprep", {}, "xprep");
@@ -625,6 +696,8 @@ void Window::gr_read(std::vector<mtl::Dispatch>& ds, const std::string& pre, boo
     // each matrix: its load-time Q8_0 copy (q8off_), else the file's own tensor (Unsloth's are Q8_0 already, their
     // inject rows F32)
     auto src = [&](const gguf::Tensor& t) -> std::pair<const mtl::Buffer*, size_t> {
+        const auto bf = hc_bf_off_.find(t.name);
+        if (bf != hc_bf_off_.end()) return {&HCbf_, bf->second};
         auto it = q8off_.find(t.name);
         return it != q8off_.end() ? std::make_pair(&Q8_, it->second) : std::make_pair(&W_, (size_t) t.offset);
     };
@@ -851,8 +924,14 @@ void Window::layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0
         ac.b(23, ct);
         const std::string ak = std::string(stream_ ? "#arena" : "") + (ct ? "#ct" : "");
         g.p = P(lib_, gun, ac, gun + ak);
-        g.args = {mtl::Arg::B(EW), mtl::Arg::B(XF_.b, XF_.plane_bytes() * xkind(tg_.type)), mtl::Arg::B(h_), mtl::Arg::B(plan_),
-                  mtl::Arg::V(a), mtl::Arg::B(XF_.b, XF_.plane_bytes() * 4)};
+        if (had_.gu(l)) {
+            rotate(ds, XF_.b, had_X_.b, N, ntok);
+            // K-quant formats need scaled activation planes and per-16 sums after the rotation.
+            if (xkind(tg_.type) != 0) xprep(ds, had_X_.b, had_X_, N);
+        }
+        const Act& routed_x = had_.gu(l) ? had_X_ : XF_;
+        g.args = {mtl::Arg::B(EW), mtl::Arg::B(routed_x.b, routed_x.plane_bytes() * xkind(tg_.type)),
+                  mtl::Arg::B(h_), mtl::Arg::B(plan_), mtl::Arg::V(a), mtl::Arg::B(routed_x.b, routed_x.plane_bytes() * 4)};
         if (stream_)
             for (int c = -1; c < 3; ++c)
                 g.args.push_back(c < 0 ? mtl::Arg::B(st_->smap(), (size_t) l * 512 * 4) : mtl::Arg::B(st_->chunk(c + 1)));
@@ -863,6 +942,7 @@ void Window::layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0
         push(ds, g);
         nb_ = true;
         gemv(ds, T(b + "ffn_down_shexp.weight"), XH_, ysh_, N, ntok);
+        if (had_.down(l)) rotate(ds, h_, h_, NFF, ntok * TOPK);
         mtl::Dispatch dd;
         dd.p = P(lib_, dnn, ac, dnn + ak);
         dd.args = {mtl::Arg::B(EW), mtl::Arg::B(h_), mtl::Arg::B(ye_), mtl::Arg::B(plan_), mtl::Arg::V(a), mtl::Arg::B(h_)};
@@ -958,7 +1038,13 @@ bool Window::run(int Tn, const int32_t* tokens, int64_t pos0, bool head, int32_t
     for (int t = 0; t < Tn; ++t) {
         float* r = R_.as<float>() + (size_t) t * HC * N;
         if (const float* img = img_row(pos0 + t)) std::memcpy(r, img, (size_t) N * 4);
-        else ref::dequant(te.type, (const uint8_t*) W_.ptr + te.offset + (size_t) tokens[t] * rb, r, N);
+        else {
+            if (tokens[t] < 0 || (uint64_t)tokens[t] >= te.shape[1]) {
+                err = "metal window: token " + std::to_string(tokens[t]) + " is outside the vocabulary";
+                return false;
+            }
+            ref::dequant(te.type, (const uint8_t*) W_.ptr + te.offset + (size_t) tokens[t] * rb, r, N);
+        }
         for (int c = 1; c < HC; ++c) std::memcpy(r + (size_t) c * N, r, (size_t) N * 4);
     }
     // ---- the PLE rows (the table read is the shared host code's), projected on the GPU
@@ -2172,7 +2258,8 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
     };
     auto dq = [&](const gguf::Tensor& t, const mtl::Buffer& out, size_t out_off = 0, uint32_t perm = 0) {
         const int n_in = (int) t.shape[0], n_out = t.shape.size() > 1 ? (int) t.shape[1] : 1;
-        if (hc_q8_ && q8off_.count(t.name)) dqb(Q8_, q8off_.at(t.name), ref::Q8_0, n_in, n_out, out, out_off, perm);
+        if (hc_bf_off_.count(t.name)) dqb(HCbf_, hc_bf_off_.at(t.name), ref::BF16, n_in, n_out, out, out_off, perm);
+        else if (hc_q8_ && q8off_.count(t.name)) dqb(Q8_, q8off_.at(t.name), ref::Q8_0, n_in, n_out, out, out_off, perm);
         else dqb(W_, t.offset, t.type, n_in, n_out, out, out_off, perm);
     };
     auto act16 = [&](const mtl::Buffer& x, const mtl::Buffer& xh, size_t n) {
@@ -2324,6 +2411,7 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
             g.ind_off = 8 * 4;
             push(ds, g);
         }
+        if (had_.gu(l)) rotate(ds, p.XS, p.XS, N, p.maxrows, true, &p.meta);
         const mtl::Buffer& EW = stream_ ? st_->chunk(0) : W_;
         auto arena_args = [&](mtl::Dispatch& d) {
             if (!stream_) return;
@@ -2351,6 +2439,7 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
         gu.ind_off = 2 * 4;
         if (stream_) cuts.push_back((int) ds.size());   // the host's turn: this layer's experts put in place
         push(ds, gu);
+        if (had_.down(l)) rotate(ds, p.HS, p.HS, NFF, p.maxrows, true, &p.meta);
         mtl::Dispatch dn;
         if (p.dn_v3) {
             const std::string fn = "mm_down3_" + std::to_string(ed.type) + "_16_64_32_2";

@@ -311,3 +311,39 @@ static inline float lane_sum(float v) {
     for (ushort o = LPR / 2; o > 0; o >>= 1) v += simd_shuffle_xor(v, o);
     return v;
 }
+
+// Gyro: canonical fp16 Hyb codebook (injected from ggml-common-tq.h by mtl_rt).
+#define T_TQ2_T 144
+#define T_TQK6 145
+#define T_TQK7 146
+template <> struct fmt<T_TQ2_T> { enum { QK = 128, BB = 34, UNIT = 16, TAB = 1 }; };
+template <> struct fmt<T_TQK6>  { enum { QK = 128, BB = 26, UNIT = 16, TAB = 1 }; };
+template <> struct fmt<T_TQK7>  { enum { QK = 128, BB = 30, UNIT = 16, TAB = 1 }; };
+template <> inline void load_tab<T_TQ2_T>(threadgroup uint*, ushort, ushort) {}
+template <> inline void load_tab<T_TQK6>(threadgroup uint*, ushort, ushort) {}
+template <> inline void load_tab<T_TQK7>(threadgroup uint*, ushort, ushort) {}
+template <int KB>
+static inline float4 tq4(device const uchar* qs, int step) {
+    uint state;
+    if (KB == 8) state = (uint(qs[(step + 31) & 31]) << 8) | qs[step];
+    else {
+        const int pos = (31 - step) * KB, byte = pos / 8, sh = pos % 8, nb = 4 * KB;
+        const uint bits = uint(qs[byte]) | (uint(qs[(byte + 1) % nb]) << 8) | (uint(qs[(byte + 2) % nb]) << 16);
+        state = bits >> sh;
+    }
+    const uint hash = (state & 0x7fffu) * 0x9e3779b1u;
+    const uint i = 2 * (hash >> 21), j = 2 * ((hash >> 10) & 2047u);
+    return float4(float(as_type<half>(strata_tq_lut[i])), float(as_type<half>(strata_tq_lut[i + 1])),
+                  float(as_type<half>(strata_tq_lut[j])), float(as_type<half>(strata_tq_lut[j + 1])));
+}
+template <int KB>
+static inline float deq_tq(device const uchar* b, int ui, thread float* q) {
+    for (int t = 0; t < 4; ++t) {
+        const float4 v = tq4<KB>(b + 2, 4 * ui + t);
+        for (int j = 0; j < 4; ++j) q[4 * t + j] = v[j];
+    }
+    return rdh(b);
+}
+template <> inline float deq<T_TQ2_T>(device const uchar* b, int u, thread float* q, threadgroup const uint*) { return deq_tq<8>(b, u, q); }
+template <> inline float deq<T_TQK6>(device const uchar* b, int u, thread float* q, threadgroup const uint*) { return deq_tq<6>(b, u, q); }
+template <> inline float deq<T_TQK7>(device const uchar* b, int u, thread float* q, threadgroup const uint*) { return deq_tq<7>(b, u, q); }

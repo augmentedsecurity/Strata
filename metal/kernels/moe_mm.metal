@@ -422,6 +422,21 @@ static inline half4 w4_signed(uint g, uint s, float sc) {
                             (s & 4) ? -float(v[2]) : float(v[2]), (s & 8) ? -float(v[3]) : float(v[3]));
     return half4(q * sc);
 }
+template <int F, int KB> struct W4Tq {
+    static inline half4 run(device const uchar* row, int k, threadgroup const uint*) {
+        device const uchar* b = row + (k / 128) * fmt<F>::BB;
+        return half4(tq4<KB>(b + 2, (k % 128) / 4) * rdh(b));
+    }
+};
+template <> struct W4<T_TQ2_T> {
+    static inline half4 run(device const uchar* row, int k, threadgroup const uint* tab) { return W4Tq<T_TQ2_T, 8>::run(row, k, tab); }
+};
+template <> struct W4<T_TQK6> {
+    static inline half4 run(device const uchar* row, int k, threadgroup const uint* tab) { return W4Tq<T_TQK6, 6>::run(row, k, tab); }
+};
+template <> struct W4<T_TQK7> {
+    static inline half4 run(device const uchar* row, int k, threadgroup const uint* tab) { return W4Tq<T_TQK7, 7>::run(row, k, tab); }
+};
 template <> struct W4<T_Q2_0> {   // 64 values a block: fp16 d, 16 bytes of 2-bit codes (value v at byte v / 4)
     // fp32 math then fp16 (an fp16-math decode was measured slower: 4.2 vs 3.5 ms a layer)
     static inline half4 run(device const uchar* row, int k, threadgroup const uint*) {
@@ -1087,3 +1102,8 @@ kernel void mm_gu5(device const uchar* W [[buffer(0)]], device const half* XS [[
 #define MMGU5(F, N, S) MMGU5_(F, N, S)
 MMGU5(T_IQ3_S, 32, 2) MMGU5(T_IQ3_S, 32, 1) MMGU5(T_IQ3_S, 16, 4) MMGU5(T_IQ3_XXS, 32, 2) MMGU5(T_IQ3_XXS, 32, 1)
 MMGU5(T_IQ3_XXS, 16, 4) MMGU5(T_IQ2_S, 32, 2) MMGU5(T_IQ2_S, 32, 1) MMGU5(T_IQ2_S, 16, 4)
+
+MM_GU2_SET(T_TQ2_T) MM_GU2_SET(T_TQK6)
+MM_DN2_SET(T_TQ2_T) MM_DN2_SET(T_TQK7)
+MMGU3(T_TQ2_T, 16, 32, 32, 4) MMGU3(T_TQK6, 16, 32, 32, 4)
+MMDN3(T_TQ2_T, 16, 64, 32, 2) MMDN3(T_TQK7, 16, 64, 32, 2)

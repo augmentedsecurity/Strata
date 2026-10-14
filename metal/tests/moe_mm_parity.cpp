@@ -23,7 +23,7 @@ struct MmPlanArgs { uint32_t n_ent, topk, n_expert, tm, n_blocks; };
 struct MmArgs { uint64_t gate_off, up_off, down_off, gu_stride, d_stride; uint32_t gu_row, d_row, n_embd, n_ff; };
 double median(std::vector<double> v) { std::sort(v.begin(), v.end()); return v[v.size() / 2]; }
 int type_of(const std::string& s) {
-    for (int t : {ref::Q2_0, ref::IQ3_XXS, ref::IQ2_XXS, ref::IQ2_XS, ref::IQ2_S, ref::IQ3_S, ref::IQ4_NL, ref::IQ4_XS, ref::Q4_K, ref::Q5_K, ref::Q6_K, ref::Q8_0, ref::Q5_1})
+    for (int t : {ref::Q2_0, ref::IQ3_XXS, ref::IQ2_XXS, ref::IQ2_XS, ref::IQ2_S, ref::IQ3_S, ref::IQ4_NL, ref::IQ4_XS, ref::Q4_K, ref::Q5_K, ref::Q6_K, ref::Q8_0, ref::Q5_1, ref::TQ2_T, ref::TQK6, ref::TQK7})
         if (s == ref::type_name(t)) return t;
     std::exit(2);
 }
@@ -32,11 +32,13 @@ float h16(float v) { return ref::f16_to_f32(ref::f32_to_f16(v)); }
 
 int main(int argc, char** argv) {
     int gu = ref::Q2_0, dn = ref::Q2_0, T = 256, TM = 16, TN = 64, TK = 16, SG = 2, DTN = -1, DTK = -1, DSG = -1;
+    bool had = false;
     bool bench = false, v2 = false, v3 = false, v4 = false, v5 = false;
     int MS = 1;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
-        if (a == "--gu") gu = type_of(argv[++i]);
+        if (a == "--hadamard") had = true;
+        else if (a == "--gu") gu = type_of(argv[++i]);
         else if (a == "--dn") dn = type_of(argv[++i]);
         else if (a == "--T") T = std::atoi(argv[++i]);
         else if (a == "--tile") std::sscanf(argv[++i], "%d,%d,%d,%d", &TM, &TN, &TK, &SG);
@@ -49,7 +51,11 @@ int main(int argc, char** argv) {
     }
     if (bench && T == 256) T = 2048;
     if (v4) TM = 16 * MS;   // the plan's tile height; mm_gu4's name carries MS instead
+    if (had && (!v2 || bench)) { std::fprintf(stderr, "--hadamard requires --v2 or --v3 parity mode\n"); return 2; }
     mtl::Context cx;
+    const int lh = had ? cx.compile({"hadamard.metal"}, "#define NO_GGML_COMMON 1\n") : -1;
+    mtl::Pipeline ph;
+    if (had) ph = cx.pipeline(lh, "hadamard_f16");
     const int lib = cx.compile({"quant.metal", "units.metal", "mma.metal", "moe_mm.metal"});
     const int NE = bench ? 512 : 64, LAYERS = bench ? 4 : 1;
     const size_t gu_row = ref::row_bytes(gu, N_EMBD), d_row = ref::row_bytes(dn, N_FF);
@@ -73,7 +79,26 @@ int main(int argc, char** argv) {
                 sw = cx.alloc(4 * (size_t)maxrows), pos = cx.alloc(4 * nent), H = cx.alloc(4 * (size_t)maxrows * N_FF),
                 YE = cx.alloc(4 * (size_t)maxrows * N_EMBD), y = cx.alloc(4 * (size_t)T * N_EMBD),
                 XS = cx.alloc(2 * (size_t)maxrows * N_EMBD), HS = cx.alloc(2 * (size_t)maxrows * N_FF);
+    auto sx = cx.alloc(4 * N_EMBD), sh = cx.alloc(4 * N_FF);
     ref::Rng r(7);
+    for (int i = 0; i < N_EMBD; ++i) sx.as<float>()[i] = r.next() & 1 ? 1.f : -1.f;
+    for (int i = 0; i < N_FF; ++i) sh.as<float>()[i] = r.next() & 1 ? 1.f : -1.f;
+    auto rotate = [&](std::vector<float>& v, const mtl::Buffer& signs) {
+        // Independent dense definition H[r,c] = (-1)^popcount(r & c) / sqrt(128).
+        const auto src = v;
+        for (size_t b = 0; b < v.size(); b += 128) for (int j = 0; j < 128; ++j) {
+            double sum = 0;
+            for (int k = 0; k < 128; ++k)
+                sum += src[b + k] * signs.as<float>()[b + k] * (__builtin_popcount(j & k) & 1 ? -1.0 : 1.0);
+            v[b + j] = float(sum / std::sqrt(128.0));
+        }
+    };
+    auto had_dispatch = [&](std::vector<mtl::Dispatch>& ds, const mtl::Buffer& buf, int width, const mtl::Buffer& signs) {
+        struct { uint32_t width, rows, block, indirect; } a{(uint32_t)width, (uint32_t)maxrows, 128, 1};
+        mtl::Dispatch d; d.p = &ph;
+        d.args = {mtl::Arg::B(buf), mtl::Arg::B(buf), mtl::Arg::B(signs), mtl::Arg::V(a), mtl::Arg::B(meta)};
+        d.grid[0] = width / 128; d.grid[1] = maxrows; d.tg[0] = 128; ds.push_back(d);
+    };
     for (size_t i = 0; i < (size_t)T * N_EMBD; ++i) x.as<float>()[i] = r.sym();
     for (int t = 0; t < T; ++t) {
         std::set<int> used;
@@ -124,10 +149,12 @@ int main(int argc, char** argv) {
                 mtl::Dispatch ga; ga.p = &pgat; ga.args = {mtl::Arg::B(x), mtl::Arg::B(stok), mtl::Arg::B(XS), mtl::Arg::V(ne)};
                 ga.grid[0] = meta.as<uint32_t>()[1]; ga.tg[0] = 256; ds.push_back(ga);
             }
+            if (had) had_dispatch(ds, XS, N_EMBD, sx);
             mtl::Dispatch g; g.p = &pgu;
             if (v2) g.args = {mtl::Arg::B(W), mtl::Arg::B(XS), mtl::Arg::B(HS), mtl::Arg::B(tiles), mtl::Arg::V(ma)};
             else g.args = {mtl::Arg::B(W), mtl::Arg::B(x), mtl::Arg::B(H), mtl::Arg::B(stok), mtl::Arg::B(tiles), mtl::Arg::V(ma)};
             g.grid[0] = N_FF / (v3 ? TN * SG : TN); g.grid[1] = meta.as<uint32_t>()[0]; g.tg[0] = 32 * SG; ds.push_back(g);
+            if (had) had_dispatch(ds, HS, N_FF, sh);
             mtl::Dispatch d; d.p = &pdn; d.args = {mtl::Arg::B(W), mtl::Arg::B(v2 ? HS : H), mtl::Arg::B(YE), mtl::Arg::B(tiles), mtl::Arg::V(ma)};
             d.grid[0] = N_EMBD / (v3 ? DTN * DSG : v2 ? DTN : TN); d.grid[1] = meta.as<uint32_t>()[0]; d.tg[0] = 32 * (v2 ? DSG : SG); ds.push_back(d);
             const uint32_t ca[4] = {(uint32_t)T, N_EMBD, TOPK, 0};
@@ -171,18 +198,26 @@ int main(int argc, char** argv) {
                 if (ids.as<int>()[i] != e) continue;
                 const int t = i / TOPK;
                 const float* xt = x.as<float>() + (size_t)t * N_EMBD;
+                std::vector<float> xr(xt, xt + N_EMBD), xh(xr.size());
+                std::transform(xr.begin(), xr.end(), xh.begin(), h16);
+                if (had) { rotate(xr, sx); rotate(xh, sx); }
                 std::vector<double> h16v(N_FF), hv(N_FF);
                 for (int f = 0; f < N_FF; ++f) {
                     double g = 0, u = 0, g16 = 0, u16 = 0;
                     for (int k = 0; k < N_EMBD; ++k) {
-                        const float xk = xt[k], xh = h16(xk);
+                        const float xk = xr[k], xhalf = h16(xh[k]);
                         g += (double)wg[(size_t)f * N_EMBD + k] * xk;
                         u += (double)wu[(size_t)f * N_EMBD + k] * xk;
-                        g16 += (double)h16(wg[(size_t)f * N_EMBD + k]) * xh;
-                        u16 += (double)h16(wu[(size_t)f * N_EMBD + k]) * xh;
+                        g16 += (double)h16(wg[(size_t)f * N_EMBD + k]) * xhalf;
+                        u16 += (double)h16(wu[(size_t)f * N_EMBD + k]) * xhalf;
                     }
                     hv[f] = g / (1 + std::exp(-g)) * u;
                     h16v[f] = h16((float)(g16 / (1 + std::exp(-g16)) * u16));
+                }
+                if (had) {
+                    std::vector<float> hf(hv.begin(), hv.end()), hh(h16v.begin(), h16v.end());
+                    rotate(hf, sh); rotate(hh, sh);
+                    for (int f = 0; f < N_FF; ++f) { hv[f] = hf[f]; h16v[f] = h16(hh[f]); }
                 }
                 const double wt = w.as<float>()[i];
                 for (int d = 0; d < N_EMBD; ++d) {

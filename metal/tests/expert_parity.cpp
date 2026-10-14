@@ -36,7 +36,7 @@ struct MoeArgs {
 };
 
 int type_of(const std::string& s) {
-    for (int t : {ref::Q2_0, ref::IQ3_XXS, ref::IQ2_XXS, ref::IQ2_XS, ref::IQ2_S, ref::IQ3_S, ref::IQ4_NL, ref::IQ4_XS, ref::Q4_K, ref::Q5_K, ref::Q6_K, ref::Q8_0, ref::Q5_1})
+    for (int t : {ref::Q2_0, ref::IQ3_XXS, ref::IQ2_XXS, ref::IQ2_XS, ref::IQ2_S, ref::IQ3_S, ref::IQ4_NL, ref::IQ4_XS, ref::Q4_K, ref::Q5_K, ref::Q6_K, ref::Q8_0, ref::Q5_1, ref::TQ2_T, ref::TQK6, ref::TQK7})
         if (s == ref::type_name(t)) return t;
     std::fprintf(stderr, "unknown type %s\n", s.c_str());
     std::exit(2);
@@ -92,6 +92,9 @@ void random_routing(ref::Rng& r, int ntok, int n_expert, std::vector<int>& ids, 
     (void)prev;
 }
 
+bool arena_test = false;
+const mtl::Buffer* arena_chunks = nullptr;
+const mtl::Buffer* arena_map = nullptr;
 struct Kernels {
     mtl::Pipeline plan, gu, dn, comb, prep;
     Cfg cgu, cdn;
@@ -140,6 +143,11 @@ void encode_layer(std::vector<mtl::Dispatch>& ds, const Kernels& K, const mtl::B
         d.p = &K.gu;
         d.args = {mtl::Arg::B(W, w_off), mtl::Arg::B(XPX, 4 * PLANE_X * xkind(g_gu_type)), mtl::Arg::B(h),
                   mtl::Arg::B(plan, plan_off), mtl::Arg::V(a), mtl::Arg::B(XPX, 4 * PLANE_X * 4)};
+        if (arena_test) {
+            d.args[0] = mtl::Arg::B(arena_chunks[0]);
+            d.args.push_back(mtl::Arg::B(*arena_map));
+            for (int c = 1; c < 4; ++c) d.args.push_back(mtl::Arg::B(arena_chunks[c]));
+        }
         d.tg[0] = K.cgu.S * 32;
         d.indirect = &plan;
         d.ind_off = plan_off + P_IGU * 4;
@@ -153,6 +161,11 @@ void encode_layer(std::vector<mtl::Dispatch>& ds, const Kernels& K, const mtl::B
         d.args = {mtl::Arg::B(W, w_off),
                   dk ? mtl::Arg::B(XPH, 4 * PLANE_H * dk) : mtl::Arg::B(h), mtl::Arg::B(ye),
                   mtl::Arg::B(plan, plan_off), mtl::Arg::V(a), mtl::Arg::B(XPH, 4 * PLANE_H * 4)};
+        if (arena_test) {
+            d.args[0] = mtl::Arg::B(arena_chunks[0]);
+            d.args.push_back(mtl::Arg::B(*arena_map));
+            for (int c = 1; c < 4; ++c) d.args.push_back(mtl::Arg::B(arena_chunks[c]));
+        }
         d.tg[0] = K.cdn.S * 32;
         d.indirect = &plan;
         d.ind_off = plan_off + P_IDN * 4;
@@ -198,6 +211,7 @@ int main(int argc, char** argv) {
         auto nx = [&] { return i + 1 < argc ? argv[++i] : (std::fprintf(stderr, "%s needs a value\n", a.c_str()), std::exit(2), (char*)nullptr); };
         if (a == "--gu") gu = type_of(nx());
         else if (a == "--dn") dn = type_of(nx());
+        else if (a == "--arena") arena_test = true;
         else if (a == "--ntok") ntok = std::atoi(nx());
         else if (a == "--gucfg") { cgu = parse_cfg(nx()); cfg_gu_set = true; }
         else if (a == "--dncfg") { cdn = parse_cfg(nx()); cfg_dn_set = true; }
@@ -209,6 +223,7 @@ int main(int argc, char** argv) {
         else if (a == "--dn-prep") g_dn_prep = true;
         else { std::fprintf(stderr, "unknown argument %s\n", a.c_str()); return 2; }
     }
+    if (arena_test && bench) return 2;
     (void)cfg_gu_set;
     (void)cfg_dn_set;
     if (dn == ref::IQ4_NL && cdn.L == 8 && !cfg_dn_set) cdn = {4, 2, 4};
@@ -223,8 +238,8 @@ int main(int argc, char** argv) {
         K.plan = cx.pipeline(lib, "moe_plan");
         K.prep = cx.pipeline(lib, "xprep");
         K.comb = cx.pipeline(lib, "moe_combine");
-        K.gu = cx.pipeline(lib, kname("moe_gu", gu, a), mtl::Constants().i(22, std::getenv("MOE_PROBE") ? std::atoi(std::getenv("MOE_PROBE")) : 0).b(23, std::getenv("QUANT_CTAB") != nullptr));
-        K.dn = cx.pipeline(lib, kname("moe_down", dn == ref::Q2_0 && !g_dn_prep ? 142 : dn, b));
+        K.gu = cx.pipeline(lib, kname("moe_gu", gu, a), mtl::Constants().i(22, std::getenv("MOE_PROBE") ? std::atoi(std::getenv("MOE_PROBE")) : 0).b(23, std::getenv("QUANT_CTAB") != nullptr).b(20, arena_test));
+        K.dn = cx.pipeline(lib, kname("moe_down", dn == ref::Q2_0 && !g_dn_prep ? 142 : dn, b), mtl::Constants().b(20, arena_test));
         K.cgu = a;
         K.cdn = b;
         return K;
@@ -270,6 +285,18 @@ int main(int argc, char** argv) {
             uint8_t* b = W.as<uint8_t>() + e * L.blob;
             ref::random_blocks(gu, b, 2 * N_FF, N_EMBD, 1000 + e);
             ref::random_blocks(dn, b + L.down_off, N_EMBD, N_FF, 5000 + e);
+        }
+        mtl::Buffer chunks[4], amap;
+        if (arena_test) {
+            const size_t stride = (L.blob + 16383) / 16384 * 16384;
+            amap = cx.alloc(4 * 512);
+            for (auto& chunk : chunks) chunk = cx.alloc(stride * (NE / 4));
+            for (int e = 0; e < NE; ++e) {
+                const int c = e % 4, slot = NE / 4 - 1 - e / 4;
+                std::memcpy(chunks[c].as<uint8_t>() + slot * stride, W.as<uint8_t>() + e * L.blob, L.blob);
+                amap.as<uint32_t>()[e] = (uint32_t(c) << 28) | uint32_t(slot * stride / 16384);
+            }
+            arena_chunks = chunks; arena_map = &amap;
         }
         std::vector<int> ids;
         std::vector<float> w;

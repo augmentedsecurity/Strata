@@ -4,6 +4,7 @@
 
 #include "mtl_rt.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -71,6 +72,16 @@ int Context::compile(const std::vector<std::string>& files, const std::string& p
         src += "#define GGML_COMMON_DECL_METAL\n#define GGML_COMMON_IMPL_METAL\n";
         src += read_file(ggml_common_path);
         src += "\n";
+    }
+    if (std::find(files.begin(), files.end(), "quant.metal") != files.end()) {
+        const std::string tq = read_file(STRATA_GGML_TQ_DEFAULT);
+        const auto at = tq.find("tq_lut_f16[4096] = {");
+        const auto begin = tq.find('{', at), end = tq.find("};", begin);
+        if (at == std::string::npos || end == std::string::npos) {
+            std::fprintf(stderr, "mtl: missing trellis codebook in ggml-common-tq.h\n");
+            std::exit(2);
+        }
+        src += "constant ushort strata_tq_lut[4096] = " + tq.substr(begin, end + 2 - begin) + "\n";
     }
     for (const auto& f : files) {
         std::string p = (f.size() && f[0] == '/') ? f : kernel_dir + "/" + f;
